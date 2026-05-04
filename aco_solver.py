@@ -121,6 +121,126 @@ def _two_opt(route: list[int], graph: SearchGraph) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
+# Inter-route relocate: move nodes between drones to reduce makespan
+# ---------------------------------------------------------------------------
+
+
+def _route_cost(route: list[int], graph: SearchGraph, v0: int) -> float:
+    """Compute total time for a drone route (travel + search), excluding base search."""
+    t = 0.0
+    for k in range(len(route) - 1):
+        t += graph.shortest_path_length(route[k], route[k + 1])
+        if route[k + 1] != v0:
+            t += graph.search_time(route[k + 1])
+    return t
+
+
+def _route_battery(route: list[int], graph: SearchGraph, v0: int) -> float:
+    """Compute battery usage for a drone route (travel + search)."""
+    usage = 0.0
+    for k in range(len(route) - 1):
+        usage += graph.shortest_path_length(route[k], route[k + 1])
+        if route[k + 1] != v0:
+            usage += graph.search_time(route[k + 1])
+    return usage
+
+
+def _inter_route_relocate(
+    drone_routes: list[list[int]],
+    graph: SearchGraph,
+    battery_budgets: list[float],
+    return_cost: dict[int, float],
+    v0: int,
+    n_drones: int,
+) -> tuple[list[list[int]], list[float]]:
+    """Try moving nodes from the busiest drone to less busy ones.
+
+    Greedy first-improvement: find the drone with the highest route cost
+    (the bottleneck determining makespan), then try removing each of its
+    search nodes and inserting it into the best position of another drone's
+    route, accepting the first move that reduces the overall makespan.
+
+    Repeats until no improving move is found.
+    """
+    routes = [r[:] for r in drone_routes]  # deep copy
+
+    improved = True
+    while improved:
+        improved = False
+
+        # Compute costs per drone
+        costs = [_route_cost(routes[d], graph, v0) for d in range(n_drones)]
+        makespan = max(costs)
+
+        # Bottleneck drone
+        d_max = int(max(range(n_drones), key=lambda d: costs[d]))
+
+        # Try removing each search node from the bottleneck drone
+        route_max = routes[d_max]
+        # search nodes are route_max[1:-1] (exclude base at start/end)
+        for idx_remove in range(1, len(route_max) - 1):
+            node = route_max[idx_remove]
+
+            # Tentatively remove node from d_max
+            new_route_max = route_max[:idx_remove] + route_max[idx_remove + 1:]
+            new_cost_max = _route_cost(new_route_max, graph, v0)
+
+            # Try inserting node into each other drone
+            best_target_d = -1
+            best_insert_idx = -1
+            best_new_makespan = makespan
+
+            for d_target in range(n_drones):
+                if d_target == d_max:
+                    continue
+
+                route_target = routes[d_target]
+                # Try each insertion position (between route_target[i] and route_target[i+1])
+                for idx_insert in range(1, len(route_target)):
+                    new_route_target = (
+                        route_target[:idx_insert] + [node] + route_target[idx_insert:]
+                    )
+
+                    # Battery feasibility check for target drone
+                    target_battery = _route_battery(new_route_target, graph, v0)
+                    if target_battery > battery_budgets[d_target] + 1e-6:
+                        continue
+
+                    new_cost_target = _route_cost(new_route_target, graph, v0)
+
+                    # New makespan: max of all drone costs with this move
+                    candidate_makespan = new_cost_max
+                    for d_other in range(n_drones):
+                        if d_other == d_max:
+                            continue
+                        elif d_other == d_target:
+                            candidate_makespan = max(candidate_makespan, new_cost_target)
+                        else:
+                            candidate_makespan = max(candidate_makespan, costs[d_other])
+
+                    if candidate_makespan < best_new_makespan - 1e-6:
+                        best_new_makespan = candidate_makespan
+                        best_target_d = d_target
+                        best_insert_idx = idx_insert
+
+            # Accept best improving move for this node
+            if best_target_d >= 0:
+                routes[d_max] = new_route_max
+                routes[best_target_d] = (
+                    routes[best_target_d][:best_insert_idx]
+                    + [node]
+                    + routes[best_target_d][best_insert_idx:]
+                )
+                improved = True
+                break  # restart from new bottleneck computation
+
+    # Recompute battery usage
+    battery_used = [_route_battery(routes[d], graph, v0) for d in range(n_drones)]
+
+    return routes, battery_used
+
+
+# ---------------------------------------------------------------------------
 # ACO Solver
 # ---------------------------------------------------------------------------
 
@@ -133,7 +253,11 @@ class ACOSolver:
     per-node time reservation table to enforce anti-collision.
 
     Pheromone is deposited only by the iteration-best and global-best ants
-    (MMAS-style elitist update).
+    (MMAS-style elitist update) with τ_min / τ_max bounds to prevent
+    premature stagnation.
+
+    Local search includes intra-route 2-opt and inter-route relocate
+    (moving nodes between drones to balance load and reduce makespan).
     """
 
     def __init__(
@@ -166,13 +290,22 @@ class ACOSolver:
         self._search_nodes = graph.search_nodes()
         self._n = graph.n_nodes()
 
-        # Initialise pheromone
+        # Initialise pheromone with MMAS bounds
         L_nn = _nn_tour_length(graph)
         self._tau0 = Q / (len(self._search_nodes) * L_nn) if self._search_nodes else 1e-3
         self._tau: dict[tuple[int, int], float] = {}
         for v in graph.nodes():
             for u in graph.neighbors(v):
                 self._tau[(v, u)] = self._tau0
+
+        # MMAS pheromone bounds — prevent premature stagnation
+        self._tau_max = Q / (rho * L_nn) if L_nn > 0 else 1.0
+        n_search = max(len(self._search_nodes), 1)
+        self._tau_min = self._tau_max / (2.0 * n_search)
+        logger.debug(
+            "MMAS bounds: tau_min=%.6f, tau_max=%.6f, tau0=%.6f",
+            self._tau_min, self._tau_max, self._tau0,
+        )
 
         # Precompute return-to-base shortest paths
         self._return_cost: dict[int, float] = {
@@ -324,10 +457,26 @@ class ACOSolver:
             # Could not cover all nodes
             return None
 
-        # Optional 2-opt local search
+        # Optional local search: intra-route 2-opt + inter-route relocate
         if self.local_search:
             for d in range(self.n_drones):
                 drone_routes[d] = _two_opt(drone_routes[d], self.graph)
+            # Inter-route relocate: try moving nodes between drones
+            drone_routes, drone_battery_used = _inter_route_relocate(
+                drone_routes, self.graph, self.battery_budgets,
+                self._return_cost, self._v0, self.n_drones,
+            )
+
+        # Recompute makespan after local search
+        makespan = 0.0
+        for d in range(self.n_drones):
+            route = drone_routes[d]
+            t = 0.0
+            for k in range(len(route) - 1):
+                t += self.graph.shortest_path_length(route[k], route[k + 1])
+                if route[k + 1] != self._v0:
+                    t += self.graph.search_time(route[k + 1])
+            makespan = max(makespan, t)
 
         return {
             "routes": {d: drone_routes[d] for d in range(self.n_drones)},
@@ -360,7 +509,7 @@ class ACOSolver:
     ) -> None:
         # Evaporation
         for key in self._tau:
-            self._tau[key] = max(self._tau[key] * (1 - self.rho), 1e-10)
+            self._tau[key] *= (1 - self.rho)
 
         # Deposit: iteration-best + global-best (MMAS-style)
         for plan in (iter_best, global_best):
@@ -371,6 +520,10 @@ class ACOSolver:
                 for k in range(len(route) - 1):
                     edge = (route[k], route[k + 1])
                     self._tau[edge] = self._tau.get(edge, self._tau0) + delta
+
+        # MMAS bounds clamping
+        for key in self._tau:
+            self._tau[key] = max(min(self._tau[key], self._tau_max), self._tau_min)
 
     # ------------------------------------------------------------------
     # Plan → Solution
