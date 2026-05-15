@@ -166,7 +166,7 @@ def plot_gantt(
 
     # Collect all visited nodes for a consistent colour map
     all_nodes = sorted({node for sched in solution.schedule.values() for node, _, _ in sched})
-    cmap = plt.cm.get_cmap("tab20", max(len(all_nodes), 1))
+    cmap = plt.colormaps["tab20"].resampled(max(len(all_nodes), 1))
     node_color_map = {v: cmap(i) for i, v in enumerate(all_nodes)}
 
     yticks, ylabels = [], []
