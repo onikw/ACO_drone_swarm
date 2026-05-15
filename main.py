@@ -93,6 +93,8 @@ def _apply_overrides(cfg: dict, args: argparse.Namespace) -> dict:
         a["local_search"] = False
     if args.aco_seed is not None:
         a["seed"] = args.aco_seed
+    if args.aco_progress_every is not None:
+        a["progress_every"] = args.aco_progress_every
 
     # --- MILP ---
     mi = cfg["milp"]
@@ -171,6 +173,8 @@ def _build_parser() -> argparse.ArgumentParser:
     a.add_argument("--aco-Q", type=float, default=None)
     a.add_argument("--aco-no-local-search", action="store_true", default=False)
     a.add_argument("--aco-seed", type=int, default=None)
+    a.add_argument("--aco-progress-every", type=int, default=None, metavar="N",
+                   help="Print live progress every N iterations (0 = silent)")
 
     # -- MILP --
     mi = p.add_argument_group("MILP options")
@@ -314,6 +318,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         print("\n--- ACO solver ---")
         ac = cfg["aco"]
+        progress_every = ac.get("progress_every", 10)
+
         aco = ACOSolver(
             graph, n_drones, battery,
             alpha=ac["alpha"],
@@ -325,19 +331,60 @@ def main(argv: Optional[list[str]] = None) -> None:
             local_search=ac["local_search"],
             seed=ac.get("seed"),
         )
-        aco_sol = aco.solve()
+
+        # Build progress callback that reads aco.initial_solution lazily:
+        # initial_solution is set inside solve() before the first iteration,
+        # so by the time the callback fires it is already populated.
+        def _progress_cb(iteration: int, total: int, global_best: float,
+                         iter_best: float, elapsed: float) -> None:
+            bar_width = 28
+            filled = int(bar_width * iteration / total)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            nn = aco.initial_solution.makespan if aco.initial_solution else None
+            vs_nn = f"  vs NN: {(nn - global_best) / nn * 100:+.1f}%" if nn else ""
+            print(
+                f"\r  [{bar}] {iteration:>4}/{total}"
+                f"  best={global_best:.2f}"
+                f"  iter={iter_best:.2f}"
+                f"  {elapsed:.0f}s"
+                f"{vs_nn}",
+                end="",
+                flush=True,
+            )
+            if iteration == total:
+                print()
+
+        aco_sol = aco.solve(
+            progress_callback=_progress_cb if progress_every > 0 else None,
+            progress_every=progress_every,
+        )
+
+        if progress_every > 0 and ac["max_iter"] % progress_every != 0:
+            print()  # ensure newline if last iter wasn't a progress tick
+
+        if aco.initial_solution:
+            init = aco.initial_solution
+            print(f"\n  Initial (NN) : makespan={init.makespan:.2f} min")
+            for d, route in init.routes.items():
+                print(f"    Drone {d}: {' → '.join(str(v) for v in route)}")
+            plot_solution(graph, init, save_path=out("nn_initial_routes.png"), show=show,
+                          title="NN Initial Solution")
+        else:
+            print("\n  Initial (NN) : no feasible solution found")
 
         if aco_sol:
-            print(aco_sol)
+            print(f"\n  Final  (ACO) : {aco_sol}")
             violations = validate_solution(aco_sol, graph, n_drones, battery)
-            print(f"Violations : {violations if violations else 'none'}")
+            print(f"  Violations   : {violations if violations else 'none'}")
+            if aco.initial_solution:
+                improvement = (aco.initial_solution.makespan - aco_sol.makespan) / aco.initial_solution.makespan * 100
+                print(f"  Improvement over NN : {improvement:+.1f}%")
+            print(f"  Best at iteration   : {aco.best_iter}/{ac['max_iter']}")
             plot_solution(graph, aco_sol, save_path=out("aco_routes.png"), show=show,
                           title="ACO Routes")
             plot_gantt(aco_sol, save_path=out("aco_gantt.png"), show=show, title="ACO Gantt")
             plot_convergence(aco.convergence_history, save_path=out("aco_convergence.png"),
                              show=show)
-            best_iter = aco.convergence_history.index(aco_sol.makespan) + 1
-            print(f"Best found at iteration: {best_iter}/{ac['max_iter']}")
         else:
             print("ACO: no feasible solution found")
 

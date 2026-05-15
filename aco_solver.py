@@ -313,14 +313,36 @@ class ACOSolver:
         }
 
         self.convergence_history: list[float] = []
+        self.initial_solution: Optional[Solution] = None
+        self.best_iter: int = 0  # 1-based iteration where global best was found
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def solve(self) -> Optional[Solution]:
-        """Run ACO and return the best found solution."""
+    def solve(
+        self,
+        progress_callback: Optional[callable] = None,
+        progress_every: int = 1,
+    ) -> Optional[Solution]:
+        """Run ACO and return the best found solution.
+
+        Parameters
+        ----------
+        progress_callback:
+            Optional callable invoked every ``progress_every`` iterations.
+            Signature: ``(iteration, total, global_best, iter_best, elapsed)``
+            where all numeric values are floats/ints.
+        progress_every:
+            Call ``progress_callback`` once every this many iterations.
+        """
         t_start = time.time()
+
+        nn_plan = self._build_nn_solution()
+        if nn_plan is not None:
+            self.initial_solution = self._plan_to_solution(nn_plan, 0.0)
+            self.initial_solution.solver = "NN-initial"
+            logger.info("NN initial solution makespan=%.2f", self.initial_solution.makespan)
 
         global_best_makespan = float("inf")
         global_best_plan: Optional[dict] = None
@@ -341,21 +363,29 @@ class ACOSolver:
             if iter_best_plan is not None and iter_best_makespan < global_best_makespan:
                 global_best_makespan = iter_best_makespan
                 global_best_plan = iter_best_plan
+                self.best_iter = iteration + 1
 
             self._update_pheromone(iter_best_plan, global_best_plan)
             self.convergence_history.append(global_best_makespan)
 
-            if iteration % 20 == 0:
-                logger.info(
-                    "ACO iter %d/%d  best_makespan=%.2f",
-                    iteration,
+            logger.debug(
+                "ACO iter %d/%d  best=%.2f  iter=%.2f",
+                iteration + 1, self.max_iter, global_best_makespan, iter_best_makespan,
+            )
+
+            if progress_callback and (iteration + 1) % progress_every == 0:
+                progress_callback(
+                    iteration + 1,
                     self.max_iter,
                     global_best_makespan,
+                    iter_best_makespan,
+                    time.time() - t_start,
                 )
 
         solve_time = time.time() - t_start
         logger.info(
-            "ACO finished in %.1fs  global_best_makespan=%.2f", solve_time, global_best_makespan
+            "ACO finished in %.1fs  global_best=%.2f  best_iter=%d/%d",
+            solve_time, global_best_makespan, self.best_iter, self.max_iter,
         )
 
         if global_best_plan is None:
@@ -363,6 +393,96 @@ class ACOSolver:
             return None
 
         return self._plan_to_solution(global_best_plan, solve_time)
+
+    # ------------------------------------------------------------------
+    # Nearest-neighbour initial solution
+    # ------------------------------------------------------------------
+
+    def _build_nn_solution(self) -> Optional[dict]:
+        """Greedy nearest-neighbour construction — no pheromone, always cheapest candidate.
+
+        Used once before the ACO loop to produce an initial reference solution
+        that is stored in ``self.initial_solution``.
+        """
+        unvisited = set(self._search_nodes)
+        trt = TimeReservationTable()
+
+        drone_pos = [self._v0] * self.n_drones
+        drone_time = [0.0] * self.n_drones
+        drone_battery_used = [0.0] * self.n_drones
+        drone_routes: list[list[int]] = [[self._v0] for _ in range(self.n_drones)]
+        drone_schedules: list[list[tuple[int, float, float]]] = [[] for _ in range(self.n_drones)]
+
+        max_steps = len(self._search_nodes) * self.n_drones + 10
+        for _ in range(max_steps):
+            if not unvisited:
+                break
+
+            d = int(min(range(self.n_drones), key=lambda k: drone_time[k]))
+            pos = drone_pos[d]
+            t_now = drone_time[d]
+            budget = self.battery_budgets[d]
+            used = drone_battery_used[d]
+
+            # Pick the cheapest reachable unvisited node (pure greedy)
+            best_cost = float("inf")
+            best_node = None
+            best_arrive = 0.0
+            for v in unvisited:
+                if not self.graph.has_edge(pos, v):
+                    continue
+                tt = self.graph.travel_time(pos, v)
+                st = self.graph.search_time(v)
+                ret = self._return_cost[v]
+                if used + tt + st + ret > budget + 1e-6:
+                    continue
+                t_arrive = trt.earliest_free(v, st, t_now + tt)
+                cost = t_arrive + st  # earliest finish time as tiebreaker
+                if cost < best_cost:
+                    best_cost = cost
+                    best_node = v
+                    best_arrive = t_arrive
+
+            if best_node is None:
+                drone_time[d] = t_now + self._return_cost[pos]
+                drone_pos[d] = self._v0
+                drone_routes[d].append(self._v0)
+                if not unvisited:
+                    break
+                drone_time[d] = float("inf")
+                continue
+
+            tt = self.graph.travel_time(pos, best_node)
+            st = self.graph.search_time(best_node)
+            t_depart = best_arrive + st
+
+            trt.reserve(best_node, best_arrive, t_depart)
+            unvisited.discard(best_node)
+
+            drone_battery_used[d] += tt + st
+            drone_pos[d] = best_node
+            drone_time[d] = t_depart
+            drone_routes[d].append(best_node)
+            drone_schedules[d].append((best_node, best_arrive, t_depart))
+
+        makespan = 0.0
+        for d in range(self.n_drones):
+            if drone_time[d] == float("inf"):
+                drone_time[d] = 0.0
+            ret_time = drone_time[d] + self._return_cost[drone_pos[d]]
+            drone_battery_used[d] += self._return_cost[drone_pos[d]]
+            drone_routes[d].append(self._v0)
+            makespan = max(makespan, ret_time)
+
+        if unvisited:
+            return None
+
+        return {
+            "routes": {d: drone_routes[d] for d in range(self.n_drones)},
+            "schedules": {d: drone_schedules[d] for d in range(self.n_drones)},
+            "battery_used": {d: drone_battery_used[d] for d in range(self.n_drones)},
+            "makespan": makespan,
+        }
 
     # ------------------------------------------------------------------
     # Ant construction

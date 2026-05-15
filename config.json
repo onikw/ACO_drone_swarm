@@ -40,7 +40,8 @@
     "max_iter": 200,
     "Q": 1.0,
     "local_search": true,
-    "seed": 42
+    "seed": 42,
+    "progress_every": 10
   },
   "milp": {
     "time_limit": 300,
