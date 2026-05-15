@@ -1,6 +1,9 @@
 {
   "graph": {
     "type": "grid",
+    "file": {
+      "path": "my_graph.json"
+    },
     "grid": {
       "rows": 2,
       "cols": 3,

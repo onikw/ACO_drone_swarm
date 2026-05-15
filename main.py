@@ -37,7 +37,10 @@ def _apply_overrides(cfg: dict, args: argparse.Namespace) -> dict:
     if args.solver is not None:
         cfg["solver"] = args.solver
 
-    if args.graph_type is not None:
+    if args.graph_file is not None:
+        cfg["graph"]["type"] = "file"
+        cfg["graph"].setdefault("file", {})["path"] = args.graph_file
+    elif args.graph_type is not None:
         cfg["graph"]["type"] = args.graph_type
 
     # --- mission ---
@@ -144,7 +147,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # -- graph --
     g = p.add_argument_group("graph")
-    g.add_argument("--graph-type", choices=["grid", "random", "cluster"], default=None)
+    g.add_argument("--graph-type", choices=["grid", "random", "cluster", "file"], default=None)
+    g.add_argument("--graph-file", default=None, metavar="FILE",
+                   help="JSON file with a custom graph (sets --graph-type file)")
     g.add_argument("--graph-seed", type=int, default=None, metavar="N")
     g.add_argument("--graph-base-node", type=int, default=None, metavar="N")
     g.add_argument("--grid-rows", type=int, default=None)
@@ -201,9 +206,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _build_graph(cfg: dict):
     from graph_generator import generate_grid_graph, generate_random_graph, generate_cluster_graph
+    from graph import SearchGraph
 
     gtype = cfg["graph"]["type"]
     p = cfg["graph"].get(gtype, {})
+
+    if gtype == "file":
+        path = p.get("path", "")
+        if not os.path.exists(path):
+            print(f"[ERROR] Graph file not found: {path}", file=sys.stderr)
+            sys.exit(1)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return SearchGraph.from_dict(data)
 
     if gtype == "grid":
         return generate_grid_graph(
